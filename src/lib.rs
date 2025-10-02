@@ -1,0 +1,339 @@
+#![cfg_attr(feature = "benches", feature(test))]
+
+use std::mem::MaybeUninit;
+use std::{hash::Hash, marker::PhantomData};
+
+use bitvec::bitvec;
+use bitvec::view::BitView;
+use ph::seeds::BitsFast;
+use ph::{BuildDefaultSeededHasher, BuildSeededHasher};
+// use regex::Regex;
+
+type Function = ph::phast::Perfect<BitsFast, ph::phast::SeedOnly, BuildDefaultSeededHasher>;
+pub struct PhMap<KOwned, V, KRef = KOwned>
+where
+    KRef: ?Sized + Hash,
+    KOwned: AsRef<KRef>,
+{
+    keys: Vec<KOwned>,
+    top_level_hashes: Vec<u64>,
+    values: Vec<MaybeUninit<V>>,
+    to_index: Function,
+    _phantom: PhantomData<fn(&KRef)>,
+}
+
+impl<KOwned, V, KRef> Drop for PhMap<KOwned, V, KRef>
+where
+    KRef: ?Sized + Hash,
+    KOwned: AsRef<KRef>,
+{
+    fn drop(&mut self) {
+        let mut dropped = bitvec![0; self.values.len()];
+
+        for k in &self.keys {
+            let idx = unsafe { self.to_index.get(&k.as_ref()).unwrap_unchecked() };
+            if !unsafe { *dropped.get_unchecked(idx) } {
+                let ptr = unsafe { self.values.get_unchecked_mut(idx).as_mut_ptr() };
+
+                unsafe {
+                    std::ptr::drop_in_place(ptr);
+                    dropped.set_unchecked(idx, true);
+                }
+            }
+        }
+    }
+}
+
+impl<KOwned, V, KRef> Default for PhMap<KOwned, V, KRef>
+where
+    KRef: ?Sized + Hash,
+    KOwned: AsRef<KRef>,
+{
+    fn default() -> Self {
+        let keys: &[&KRef] = &[];
+        let to_index = Function::with_slice_p_hash_sc(
+            keys,
+            &ph::phast::Params::new(BitsFast(0), ph::phast::bits_per_seed_to_100_bucket_size(0)),
+            BuildDefaultSeededHasher::default(),
+            ph::phast::SeedOnly,
+        );
+        Self {
+            keys: vec![],
+            values: vec![],
+            top_level_hashes: vec![],
+            to_index,
+            // member_set: Set::default(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<KOwned, V, KRef> PhMap<KOwned, V, KRef>
+where
+    KRef: ?Sized + Hash,
+    KOwned: AsRef<KRef>,
+{
+    pub fn insert(&mut self, key: KOwned, value: V) {
+        self.extend(std::iter::once((key, value)))
+    }
+
+    pub fn extend<KV>(&mut self, kv: KV)
+    where
+        KV: IntoIterator<Item = (KOwned, V)>,
+    {
+        unsafe { self.values.set_len(0) };
+
+        let hasher = &self.to_index.hasher();
+
+        let (keys, values_and_key_hashes): (Vec<_>, Vec<_>) = self
+            .keys
+            .drain(..)
+            .map(|key| {
+                let value = unsafe { take_unchecked(&self.values, &self.to_index, key.as_ref()) };
+
+                (key, value)
+            })
+            .chain(kv)
+            .map(|(key, value)| {
+                let hash = hasher.hash_one(key.as_ref(), 0);
+
+                (key, (value, hash))
+            })
+            .unzip();
+
+        let bits = keys.len().next_power_of_two().ilog(2) + 1;
+        let bits_u8 = bits.try_into().unwrap();
+        {
+            let key_refs = keys.iter().map(|k| k.as_ref()).collect::<Vec<_>>();
+            self.to_index = Function::with_vec_p_hash_sc(
+                key_refs,
+                &ph::phast::Params::new(
+                    BitsFast(bits_u8),
+                    ph::phast::bits_per_seed_to_100_bucket_size(bits_u8),
+                ),
+                BuildDefaultSeededHasher::default(),
+                ph::phast::SeedOnly,
+            );
+        }
+
+        // We need to set a minimum value above 4, as for some reason Rust doesn't reserve
+        // correctly for small vectors.
+        let mut max_idx = 8;
+
+        self.top_level_hashes = vec![0; keys.len()];
+
+        for (key, (value, hash)) in keys.iter().zip(values_and_key_hashes) {
+            let idx = self
+                .to_index
+                .get_with_top_level_hash(key.as_ref(), hash)
+                .unwrap();
+
+            // self.member_set.insert(hash);
+
+            max_idx = max_idx.max(idx);
+
+            if let Some(extra_capacity) = (max_idx + 1).checked_sub(self.values.capacity()) {
+                self.values.reserve(extra_capacity);
+            }
+
+            self.top_level_hashes
+                .resize(self.top_level_hashes.len().max(max_idx + 1), 0);
+
+            debug_assert!(self.values.capacity() > max_idx);
+            debug_assert!(self.top_level_hashes.len() > max_idx);
+
+            // Safety: The inner values are `MaybeUninit` anyway
+            unsafe { self.values.set_len(max_idx + 1) };
+            unsafe {
+                self.values.get_unchecked_mut(idx).write(value);
+                *self.top_level_hashes.get_unchecked_mut(idx) = hash
+            }
+        }
+
+        self.values.shrink_to_fit();
+
+        self.keys = keys;
+    }
+
+    pub fn get<K>(&self, key: &K) -> Option<&V>
+    where
+        K: ?Sized + AsRef<KRef>,
+    {
+        // TODO: This assumes that the `Hash` implementation for `KRef` is well-behaved,
+        //       but does not cause unsafety if this is not the case.
+        let hash = self.to_index.hasher().hash_one(key.as_ref(), 0);
+        let idx = self.to_index.get_with_top_level_hash(&key.as_ref(), hash)?;
+        if *self.top_level_hashes.get(idx)? == hash {
+            Some(unsafe { self.values.get_unchecked(idx).assume_init_ref() })
+        } else {
+            None
+        }
+    }
+
+    /// # Safety
+    /// `key` must be in the map.
+    pub unsafe fn get_unchecked<K>(&self, key: &K) -> &V
+    where
+        K: ?Sized + AsRef<KRef>,
+    {
+        let idx = unsafe { self.to_index.get(&key.as_ref()).unwrap_unchecked() };
+        unsafe { self.values.get_unchecked(idx).assume_init_ref() }
+    }
+
+    pub fn get_mut<K>(&mut self, key: &K) -> Option<&mut V>
+    where
+        K: ?Sized + AsRef<KRef>,
+    {
+        // TODO: This assumes that the `Hash` implementation for `KRef` is well-behaved,
+        //       but does not cause unsafety if this is not the case.
+        let hash = self.to_index.hasher().hash_one(key.as_ref(), 0);
+        let idx = self.to_index.get_with_top_level_hash(&key.as_ref(), hash)?;
+        if *self.top_level_hashes.get(idx)? == hash {
+            Some(unsafe { self.values.get_unchecked_mut(idx).assume_init_mut() })
+        } else {
+            None
+        }
+    }
+    /// # Safety
+    /// `key` must be in the map.
+    pub unsafe fn get_unchecked_mut<K>(&mut self, key: &K) -> &mut V
+    where
+        K: ?Sized + AsRef<KRef>,
+    {
+        let idx = unsafe { self.to_index.get(&key.as_ref()).unwrap_unchecked() };
+        unsafe { self.values.get_unchecked_mut(idx).assume_init_mut() }
+    }
+}
+
+/// # Safety
+/// `to_index` must have been created with `key` as one of its keys, and `vals` must have a length
+/// of at least the maxmimum value that `to_index` can return.
+unsafe fn get_unchecked_uninit<'a, K, V>(
+    vals: &'a [MaybeUninit<V>],
+    to_index: &Function,
+    key: &K,
+) -> &'a MaybeUninit<V>
+where
+    K: ?Sized + Hash,
+{
+    unsafe { vals.get_unchecked(to_index.get(&key).unwrap_unchecked()) }
+}
+
+/// # Safety
+/// `to_index` must have been created with `key` as one of its keys, and `vals` must have a length
+/// of at least the maxmimum value that `to_index` can return.
+pub unsafe fn take_unchecked<K, V>(vals: &[MaybeUninit<V>], to_index: &Function, key: &K) -> V
+where
+    K: ?Sized + Hash,
+{
+    unsafe { get_unchecked_uninit(vals, to_index, key).assume_init_read() }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::PhMap;
+
+    #[test]
+    fn it_works() {
+        let mut hashmap: PhMap<&str, &str, str> = PhMap::default();
+
+        let kvs = [
+            ("foo1", "bar"),
+            ("foo2", "baz"),
+            ("foo3", "bar"),
+            ("foo4", "qux"),
+            ("foo5", "foobar"),
+            ("foo6", "bazqux"),
+        ];
+        hashmap.extend(kvs.iter().copied());
+
+        for (k, v) in kvs {
+            assert_eq!(unsafe { hashmap.get_unchecked(k) }, &v);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "benches"))]
+mod bench {
+    extern crate test;
+
+    #[cfg(feature = "gxhash")]
+    type DefaultHasher = gxhash::GxHasher;
+    #[cfg(not(feature = "gxhash"))]
+    type DefaultHasher = rapidhash::RapidHasher;
+
+    #[cfg(feature = "gxhash")]
+    type DefaultBuildHasher = gxhash::GxBuildHasher;
+    #[cfg(not(feature = "gxhash"))]
+    type DefaultBuildHasher = rapidhash::RapidBuildHasher;
+
+    use crate::PhMap;
+    use std::{
+        collections::HashMap,
+        hash::{Hash, Hasher},
+    };
+
+    fn make_kvs() -> impl Iterator<Item = (String, String)> {
+        const SIZE: usize = 4096;
+
+        (0..SIZE).map(|i| {
+            let mut hasher = std::hash::DefaultHasher::default();
+            i.hash(&mut hasher);
+            let hash = hasher.finish();
+
+            let hash_lo = hash as u32;
+            let hash_hi = hash >> 32 as u32;
+
+            let wrapped_hash = hash as u8;
+
+            (
+                format!("{hash_lo}-test-key-{hash_hi}"),
+                format!("test-val-{wrapped_hash}"),
+            )
+        })
+    }
+
+    #[bench]
+    fn bench_phmap_get(b: &mut test::Bencher) {
+        let mut ph_map = PhMap::<String, String, str>::default();
+        let kvs = make_kvs().collect::<Vec<_>>();
+        ph_map.extend(kvs.iter().cloned());
+
+        let mut idxs = (0..kvs.len()).cycle();
+
+        b.iter(|| {
+            let (key, value) = std::hint::black_box(&kvs[idxs.next().unwrap()]);
+            assert_eq!(std::hint::black_box(ph_map.get(&key[..])), Some(value));
+        })
+    }
+
+    #[bench]
+    fn bench_hashmap_get(b: &mut test::Bencher) {
+        let mut hashmap = HashMap::<String, String, DefaultBuildHasher>::with_hasher(
+            DefaultBuildHasher::default(),
+        );
+        let kvs = make_kvs().collect::<Vec<_>>();
+        hashmap.extend(kvs.iter().cloned());
+
+        let mut idxs = (0..kvs.len()).cycle();
+
+        b.iter(|| {
+            let (key, value) = std::hint::black_box(&kvs[idxs.next().unwrap()]);
+            assert_eq!(std::hint::black_box(hashmap.get(&key[..])), Some(value));
+        })
+    }
+    #[bench]
+    fn bench_hashbrown_get(b: &mut test::Bencher) {
+        let mut hashbrown =
+            hashbrown::HashMap::<String, String, _>::with_hasher(DefaultBuildHasher::default());
+        let kvs = make_kvs().collect::<Vec<_>>();
+        hashbrown.extend(kvs.iter().cloned());
+
+        let mut idxs = (0..kvs.len()).cycle();
+
+        b.iter(|| {
+            let (key, value) = std::hint::black_box(&kvs[idxs.next().unwrap()]);
+            assert_eq!(std::hint::black_box(hashbrown.get(&key[..])), Some(value));
+        })
+    }
+}

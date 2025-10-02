@@ -1,0 +1,3 @@
+[submodule "bsuccinct-rs"]
+	path = bsuccinct-rs
+	url = git@github.com:eira-fransham/bsuccinct-rs.git

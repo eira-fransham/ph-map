@@ -1,0 +1,30 @@
+[package]
+name = "ph-map"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitvec = "1.0"
+fastset = "0.5"
+soavec = "0.1"
+soavec_derive = "0.1"
+ph = { path = "./bsuccinct-rs/ph", features = ["rapidhash", "sux"] }
+csf = { path = "./bsuccinct-rs/csf" }
+rapidhash = "1.3"
+gxhash = { version = "3.5", optional = true }
+phf = "0.13"
+
+[dev-dependencies]
+hashbrown = "*"
+boomphf = "0.6"
+
+[build-dependencies]
+phf = { version = "0.13", default-features = false }
+phf_codegen = "0.13"
+
+[profile.bench]
+debug = true
+
+[features]
+benches = []
+gxhash = ["dep:gxhash", "ph/gxhash"]
