@@ -1,13 +1,13 @@
 #![cfg_attr(feature = "benches", feature(test))]
 
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
+use std::ops::Range;
 use std::{hash::Hash, marker::PhantomData};
 
 use bitvec::bitvec;
-use bitvec::view::BitView;
+use itertools::Itertools;
 use ph::seeds::BitsFast;
 use ph::{BuildDefaultSeededHasher, BuildSeededHasher};
-// use regex::Regex;
 
 type Function = ph::phast::Perfect<BitsFast, ph::phast::SeedOnly, BuildDefaultSeededHasher>;
 pub struct PhMap<KOwned, V, KRef = KOwned>
@@ -22,6 +22,87 @@ where
     _phantom: PhantomData<fn(&KRef)>,
 }
 
+pub struct PhStrMap<V> {
+    range: Range<usize>,
+    inner_map: ManuallyDrop<PhMap<Vec<u8>, V, [u8]>>,
+}
+
+impl<V> Default for PhStrMap<V> {
+    fn default() -> Self {
+        Self {
+            range: 0..0,
+            inner_map: Default::default(),
+        }
+    }
+}
+
+impl<V> PhStrMap<V> {
+    pub fn insert(&mut self, key: String, value: V) {
+        self.extend(std::iter::once((key, value)))
+    }
+
+    pub fn extend<KV>(&mut self, kv: KV)
+    where
+        KV: IntoIterator<Item = (String, V)>,
+    {
+        let mut kvs: Vec<(Vec<u8>, V)> = kv.into_iter().map(|(k, v)| (k.into_bytes(), v)).collect();
+        let range = smallest_uncommon_range(kvs.iter().map(|(k, _)| &**k));
+
+        kvs.iter_mut().for_each(|(k, _)| {
+            let substring = k[range.clone()].to_owned();
+            *k = substring;
+        });
+
+        assert!(range == self.range || self.range.is_empty());
+
+        self.range = range;
+
+        assert!(kvs.iter().map(|(k, _)| &**k).all_unique());
+
+        self.inner_map.extend(kvs);
+    }
+
+    pub fn get<K>(&self, key: &K) -> Option<&V>
+    where
+        K: ?Sized + AsRef<str>,
+    {
+        self.inner_map
+            .get(&key.as_ref().as_bytes()[self.range.clone()])
+    }
+
+    /// # Safety
+    /// `key` must be in the map.
+    pub unsafe fn get_unchecked<K>(&self, key: &K) -> &V
+    where
+        K: ?Sized + AsRef<str>,
+    {
+        unsafe {
+            self.inner_map
+                .get_unchecked(&key.as_ref().as_bytes()[self.range.clone()])
+        }
+    }
+
+    pub fn get_mut<K>(&mut self, key: &K) -> Option<&mut V>
+    where
+        K: ?Sized + AsRef<str>,
+    {
+        self.inner_map
+            .get_mut(&key.as_ref().as_bytes()[self.range.clone()])
+    }
+
+    /// # Safety
+    /// `key` must be in the map.
+    pub unsafe fn get_unchecked_mut<K>(&mut self, key: &K) -> &mut V
+    where
+        K: ?Sized + AsRef<str>,
+    {
+        unsafe {
+            self.inner_map
+                .get_unchecked_mut(&key.as_ref().as_bytes()[self.range.clone()])
+        }
+    }
+}
+
 impl<KOwned, V, KRef> Drop for PhMap<KOwned, V, KRef>
 where
     KRef: ?Sized + Hash,
@@ -30,8 +111,13 @@ where
     fn drop(&mut self) {
         let mut dropped = bitvec![0; self.values.len()];
 
-        for k in &self.keys {
-            let idx = unsafe { self.to_index.get(&k.as_ref()).unwrap_unchecked() };
+        for key in &self.keys {
+            // TODO: This assumes that the `Hash` implementation for `KRef` is well-behaved,
+            //       but does not cause unsafety if this is not the case.
+            let hash = self.to_index.hasher().hash_one(key.as_ref(), 0);
+            let Some(idx) = self.to_index.get_with_top_level_hash(&key.as_ref(), hash) else {
+                continue;
+            };
             if !unsafe { *dropped.get_unchecked(idx) } {
                 let ptr = unsafe { self.values.get_unchecked_mut(idx).as_mut_ptr() };
 
@@ -122,33 +208,39 @@ where
 
         self.top_level_hashes = vec![0; keys.len()];
 
-        for (key, (value, hash)) in keys.iter().zip(values_and_key_hashes) {
-            let idx = self
-                .to_index
-                .get_with_top_level_hash(key.as_ref(), hash)
-                .unwrap();
+        let all_indices_unique = keys
+            .iter()
+            .zip(values_and_key_hashes)
+            .map(|(key, (value, hash))| {
+                let idx = self
+                    .to_index
+                    .get_with_top_level_hash(key.as_ref(), hash)
+                    .unwrap();
 
-            // self.member_set.insert(hash);
+                max_idx = max_idx.max(idx);
 
-            max_idx = max_idx.max(idx);
+                if let Some(extra_capacity) = (max_idx + 1).checked_sub(self.values.capacity()) {
+                    self.values.reserve(extra_capacity);
+                }
 
-            if let Some(extra_capacity) = (max_idx + 1).checked_sub(self.values.capacity()) {
-                self.values.reserve(extra_capacity);
-            }
+                self.top_level_hashes
+                    .resize(self.top_level_hashes.len().max(max_idx + 1), 0);
 
-            self.top_level_hashes
-                .resize(self.top_level_hashes.len().max(max_idx + 1), 0);
+                debug_assert!(self.values.capacity() > max_idx);
+                debug_assert!(self.top_level_hashes.len() > max_idx);
 
-            debug_assert!(self.values.capacity() > max_idx);
-            debug_assert!(self.top_level_hashes.len() > max_idx);
+                // Safety: The inner values are `MaybeUninit` anyway
+                unsafe { self.values.set_len(max_idx + 1) };
+                unsafe {
+                    self.values.get_unchecked_mut(idx).write(value);
+                    *self.top_level_hashes.get_unchecked_mut(idx) = hash;
+                }
 
-            // Safety: The inner values are `MaybeUninit` anyway
-            unsafe { self.values.set_len(max_idx + 1) };
-            unsafe {
-                self.values.get_unchecked_mut(idx).write(value);
-                *self.top_level_hashes.get_unchecked_mut(idx) = hash
-            }
-        }
+                idx
+            })
+            .all_unique();
+
+        assert!(all_indices_unique);
 
         self.values.shrink_to_fit();
 
@@ -162,7 +254,7 @@ where
         // TODO: This assumes that the `Hash` implementation for `KRef` is well-behaved,
         //       but does not cause unsafety if this is not the case.
         let hash = self.to_index.hasher().hash_one(key.as_ref(), 0);
-        let idx = self.to_index.get_with_top_level_hash(&key.as_ref(), hash)?;
+        let idx = self.to_index.get_with_top_level_hash(key.as_ref(), hash)?;
         if *self.top_level_hashes.get(idx)? == hash {
             Some(unsafe { self.values.get_unchecked(idx).assume_init_ref() })
         } else {
@@ -176,7 +268,7 @@ where
     where
         K: ?Sized + AsRef<KRef>,
     {
-        let idx = unsafe { self.to_index.get(&key.as_ref()).unwrap_unchecked() };
+        let idx = unsafe { self.to_index.get(key.as_ref()).unwrap_unchecked() };
         unsafe { self.values.get_unchecked(idx).assume_init_ref() }
     }
 
@@ -200,7 +292,7 @@ where
     where
         K: ?Sized + AsRef<KRef>,
     {
-        let idx = unsafe { self.to_index.get(&key.as_ref()).unwrap_unchecked() };
+        let idx = unsafe { self.to_index.get(key.as_ref()).unwrap_unchecked() };
         unsafe { self.values.get_unchecked_mut(idx).assume_init_mut() }
     }
 }
@@ -229,8 +321,41 @@ where
     unsafe { get_unchecked_uninit(vals, to_index, key).assume_init_read() }
 }
 
+/// `strs` must be sorted.
+fn smallest_uncommon_range<'a, I>(strs: I) -> Range<usize>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+    I::IntoIter: ExactSizeIterator + Clone,
+{
+    let strs = strs.into_iter();
+    let mut start = 0;
+
+    loop {
+        if !strs.clone().map(|i| i[start]).all_equal() {
+            break;
+        }
+
+        start += 1;
+    }
+
+    let mut out = start..start + 1;
+    loop {
+        if strs.clone().map(|s| &s[out.clone()]).all_unique() {
+            println!("Found {out:?}");
+            break;
+        }
+
+        out.end += 1;
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod test {
+    use std::hash::{Hash as _, Hasher as _};
+
+    use super::smallest_uncommon_range;
     use crate::PhMap;
 
     #[test]
@@ -251,6 +376,35 @@ mod test {
             assert_eq!(unsafe { hashmap.get_unchecked(k) }, &v);
         }
     }
+
+    #[test]
+    fn find_smallest_uncommon_range() {
+        fn make_kvs() -> impl Iterator<Item = (String, String)> {
+            const SIZE: usize = 4096;
+
+            (0..SIZE).map(|i| {
+                let mut hasher = std::hash::DefaultHasher::default();
+                i.hash(&mut hasher);
+                let hash = hasher.finish();
+
+                let hash_lo = hash as u32;
+                let hash_hi = hash >> 32;
+
+                let wrapped_hash = hash as u8;
+
+                (
+                    format!("test-key-{hash_lo}-test-{hash_hi}"),
+                    format!("test-val-{wrapped_hash}"),
+                )
+            })
+        }
+
+        let (ks, _vs): (Vec<_>, Vec<_>) = make_kvs().unzip();
+        assert_eq!(
+            smallest_uncommon_range(ks.iter().map(|k| k.as_bytes())),
+            9..18,
+        );
+    }
 }
 
 #[cfg(all(test, feature = "benches"))]
@@ -258,23 +412,18 @@ mod bench {
     extern crate test;
 
     #[cfg(feature = "gxhash")]
-    type DefaultHasher = gxhash::GxHasher;
-    #[cfg(not(feature = "gxhash"))]
-    type DefaultHasher = rapidhash::RapidHasher;
-
-    #[cfg(feature = "gxhash")]
     type DefaultBuildHasher = gxhash::GxBuildHasher;
     #[cfg(not(feature = "gxhash"))]
     type DefaultBuildHasher = rapidhash::RapidBuildHasher;
 
-    use crate::PhMap;
+    use crate::{PhMap, PhStrMap};
     use std::{
         collections::HashMap,
         hash::{BuildHasher, Hash, Hasher},
     };
 
     fn make_kvs() -> impl Iterator<Item = (String, String)> {
-        const SIZE: usize = 4096;
+        const SIZE: usize = 128;
 
         (0..SIZE).map(|i| {
             let mut hasher = std::hash::DefaultHasher::default();
@@ -296,6 +445,20 @@ mod bench {
     #[bench]
     fn bench_phmap_get(b: &mut test::Bencher) {
         let mut ph_map = PhMap::<String, String, str>::default();
+        let kvs = make_kvs().collect::<Vec<_>>();
+        ph_map.extend(kvs.iter().cloned());
+
+        let mut idxs = (0..kvs.len()).cycle();
+
+        b.iter(|| {
+            let (key, value) = std::hint::black_box(&kvs[idxs.next().unwrap()]);
+            assert_eq!(std::hint::black_box(ph_map.get(&key[..])), Some(value));
+        })
+    }
+
+    #[bench]
+    fn bench_phstrmap_get(b: &mut test::Bencher) {
+        let mut ph_map = PhStrMap::<String>::default();
         let kvs = make_kvs().collect::<Vec<_>>();
         ph_map.extend(kvs.iter().cloned());
 

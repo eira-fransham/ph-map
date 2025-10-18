@@ -13,6 +13,7 @@ csf = { path = "./bsuccinct-rs/csf" }
 rapidhash = "1.3"
 gxhash = { version = "3.5", optional = true }
 phf = "0.13"
+itertools = "0.14"
 
 [dev-dependencies]
 hashbrown = "*"
