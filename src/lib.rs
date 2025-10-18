@@ -55,8 +55,6 @@ impl<V> PhStrMap<V> {
 
         self.range = range;
 
-        assert!(kvs.iter().map(|(k, _)| &**k).all_unique());
-
         self.inner_map.extend(kvs);
     }
 
@@ -65,7 +63,7 @@ impl<V> PhStrMap<V> {
         K: ?Sized + AsRef<str>,
     {
         self.inner_map
-            .get(&key.as_ref().as_bytes()[self.range.clone()])
+            .get(key.as_ref().as_bytes().get(self.range.clone())?)
     }
 
     /// # Safety
@@ -76,7 +74,7 @@ impl<V> PhStrMap<V> {
     {
         unsafe {
             self.inner_map
-                .get_unchecked(&key.as_ref().as_bytes()[self.range.clone()])
+                .get_unchecked(key.as_ref().as_bytes().get_unchecked(self.range.clone()))
         }
     }
 
@@ -85,7 +83,7 @@ impl<V> PhStrMap<V> {
         K: ?Sized + AsRef<str>,
     {
         self.inner_map
-            .get_mut(&key.as_ref().as_bytes()[self.range.clone()])
+            .get_mut(key.as_ref().as_bytes().get(self.range.clone())?)
     }
 
     /// # Safety
@@ -96,7 +94,7 @@ impl<V> PhStrMap<V> {
     {
         unsafe {
             self.inner_map
-                .get_unchecked_mut(&key.as_ref().as_bytes()[self.range.clone()])
+                .get_unchecked_mut(key.as_ref().as_bytes().get_unchecked(self.range.clone()))
         }
     }
 }
@@ -188,7 +186,7 @@ where
 
             max_idx = max_idx.max(idx);
 
-            if let Some(extra_capacity) = (max_idx + 1).checked_sub(self.values.capacity()) {
+            if let Some(extra_capacity) = (max_idx + 1).checked_sub(self.values.len()) {
                 self.values
                     .extend(std::iter::from_fn(|| Some(None)).take(extra_capacity));
             }
@@ -196,7 +194,7 @@ where
             self.top_level_hashes
                 .resize(self.top_level_hashes.len().max(max_idx + 1), 0);
 
-            debug_assert!(self.values.capacity() > max_idx);
+            debug_assert!(self.values.len() > max_idx);
             debug_assert!(self.top_level_hashes.len() > max_idx);
 
             unsafe {
