@@ -1,10 +1,8 @@
 #![cfg_attr(feature = "benches", feature(test))]
 
-use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops::Range;
 use std::{hash::Hash, marker::PhantomData};
 
-use bitvec::bitvec;
 use itertools::Itertools;
 use ph::seeds::BitsFast;
 use ph::{BuildDefaultSeededHasher, BuildSeededHasher};
@@ -17,14 +15,14 @@ where
 {
     keys: Vec<KOwned>,
     top_level_hashes: Vec<u64>,
-    values: Vec<MaybeUninit<V>>,
+    values: Vec<Option<V>>,
     to_index: Function,
     _phantom: PhantomData<fn(&KRef)>,
 }
 
 pub struct PhStrMap<V> {
     range: Range<usize>,
-    inner_map: ManuallyDrop<PhMap<Vec<u8>, V, [u8]>>,
+    inner_map: PhMap<Vec<u8>, V, [u8]>,
 }
 
 impl<V> Default for PhStrMap<V> {
@@ -103,33 +101,6 @@ impl<V> PhStrMap<V> {
     }
 }
 
-impl<KOwned, V, KRef> Drop for PhMap<KOwned, V, KRef>
-where
-    KRef: ?Sized + Hash,
-    KOwned: AsRef<KRef>,
-{
-    fn drop(&mut self) {
-        let mut dropped = bitvec![0; self.values.len()];
-
-        for key in &self.keys {
-            // TODO: This assumes that the `Hash` implementation for `KRef` is well-behaved,
-            //       but does not cause unsafety if this is not the case.
-            let hash = self.to_index.hasher().hash_one(key.as_ref(), 0);
-            let Some(idx) = self.to_index.get_with_top_level_hash(&key.as_ref(), hash) else {
-                continue;
-            };
-            if !unsafe { *dropped.get_unchecked(idx) } {
-                let ptr = unsafe { self.values.get_unchecked_mut(idx).as_mut_ptr() };
-
-                unsafe {
-                    std::ptr::drop_in_place(ptr);
-                    dropped.set_unchecked(idx, true);
-                }
-            }
-        }
-    }
-}
-
 impl<KOwned, V, KRef> Default for PhMap<KOwned, V, KRef>
 where
     KRef: ?Sized + Hash,
@@ -175,7 +146,8 @@ where
             .keys
             .drain(..)
             .map(|key| {
-                let value = unsafe { take_unchecked(&self.values, &self.to_index, key.as_ref()) };
+                let value =
+                    unsafe { take_unchecked(&mut self.values, &self.to_index, key.as_ref()) };
 
                 (key, value)
             })
@@ -208,39 +180,47 @@ where
 
         self.top_level_hashes = vec![0; keys.len()];
 
-        let all_indices_unique = keys
-            .iter()
-            .zip(values_and_key_hashes)
-            .map(|(key, (value, hash))| {
-                let idx = self
-                    .to_index
-                    .get_with_top_level_hash(key.as_ref(), hash)
-                    .unwrap();
+        let mut insert_one = |key: &KOwned, value: V, hash: u64| -> usize {
+            let idx = self
+                .to_index
+                .get_with_top_level_hash(key.as_ref(), hash)
+                .unwrap();
 
-                max_idx = max_idx.max(idx);
+            max_idx = max_idx.max(idx);
 
-                if let Some(extra_capacity) = (max_idx + 1).checked_sub(self.values.capacity()) {
-                    self.values.reserve(extra_capacity);
-                }
+            if let Some(extra_capacity) = (max_idx + 1).checked_sub(self.values.capacity()) {
+                self.values
+                    .extend(std::iter::from_fn(|| Some(None)).take(extra_capacity));
+            }
 
-                self.top_level_hashes
-                    .resize(self.top_level_hashes.len().max(max_idx + 1), 0);
+            self.top_level_hashes
+                .resize(self.top_level_hashes.len().max(max_idx + 1), 0);
 
-                debug_assert!(self.values.capacity() > max_idx);
-                debug_assert!(self.top_level_hashes.len() > max_idx);
+            debug_assert!(self.values.capacity() > max_idx);
+            debug_assert!(self.top_level_hashes.len() > max_idx);
 
-                // Safety: The inner values are `MaybeUninit` anyway
-                unsafe { self.values.set_len(max_idx + 1) };
-                unsafe {
-                    self.values.get_unchecked_mut(idx).write(value);
-                    *self.top_level_hashes.get_unchecked_mut(idx) = hash;
-                }
+            unsafe {
+                *self.values.get_unchecked_mut(idx) = Some(value);
+                *self.top_level_hashes.get_unchecked_mut(idx) = hash;
+            }
 
-                idx
-            })
-            .all_unique();
+            idx
+        };
+        let keys_and_values_and_hashes = keys.iter().zip(values_and_key_hashes);
 
-        assert!(all_indices_unique);
+        #[cfg(debug_assertions)]
+        {
+            let all_indices_unique = keys_and_values_and_hashes
+                .map(move |(k, (v, h))| insert_one(k, v, h))
+                .all_unique();
+
+            assert!(all_indices_unique);
+        }
+
+        #[cfg(not(debug_assertions))]
+        keys_and_values_and_hashes.for_each(move |(k, (v, h))| {
+            insert_one(k, v, h);
+        });
 
         self.values.shrink_to_fit();
 
@@ -256,7 +236,7 @@ where
         let hash = self.to_index.hasher().hash_one(key.as_ref(), 0);
         let idx = self.to_index.get_with_top_level_hash(key.as_ref(), hash)?;
         if *self.top_level_hashes.get(idx)? == hash {
-            Some(unsafe { self.values.get_unchecked(idx).assume_init_ref() })
+            Some(unsafe { self.values.get_unchecked(idx).as_ref().unwrap_unchecked() })
         } else {
             None
         }
@@ -269,7 +249,7 @@ where
         K: ?Sized + AsRef<KRef>,
     {
         let idx = unsafe { self.to_index.get(key.as_ref()).unwrap_unchecked() };
-        unsafe { self.values.get_unchecked(idx).assume_init_ref() }
+        unsafe { self.values.get_unchecked(idx).as_ref().unwrap_unchecked() }
     }
 
     pub fn get_mut<K>(&mut self, key: &K) -> Option<&mut V>
@@ -281,7 +261,12 @@ where
         let hash = self.to_index.hasher().hash_one(key.as_ref(), 0);
         let idx = self.to_index.get_with_top_level_hash(key.as_ref(), hash)?;
         if *self.top_level_hashes.get(idx)? == hash {
-            Some(unsafe { self.values.get_unchecked_mut(idx).assume_init_mut() })
+            Some(unsafe {
+                self.values
+                    .get_unchecked_mut(idx)
+                    .as_mut()
+                    .unwrap_unchecked()
+            })
         } else {
             None
         }
@@ -293,32 +278,24 @@ where
         K: ?Sized + AsRef<KRef>,
     {
         let idx = unsafe { self.to_index.get(key.as_ref()).unwrap_unchecked() };
-        unsafe { self.values.get_unchecked_mut(idx).assume_init_mut() }
+        unsafe {
+            self.values
+                .get_unchecked_mut(idx)
+                .as_mut()
+                .unwrap_unchecked()
+        }
     }
 }
 
 /// # Safety
 /// `to_index` must have been created with `key` as one of its keys, and `vals` must have a length
 /// of at least the maxmimum value that `to_index` can return.
-unsafe fn get_unchecked_uninit<'a, K, V>(
-    vals: &'a [MaybeUninit<V>],
-    to_index: &Function,
-    key: &K,
-) -> &'a MaybeUninit<V>
+pub unsafe fn take_unchecked<K, V>(vals: &mut [Option<V>], to_index: &Function, key: &K) -> V
 where
     K: ?Sized + Hash,
 {
-    unsafe { vals.get_unchecked(to_index.get(&key).unwrap_unchecked()) }
-}
-
-/// # Safety
-/// `to_index` must have been created with `key` as one of its keys, and `vals` must have a length
-/// of at least the maxmimum value that `to_index` can return.
-pub unsafe fn take_unchecked<K, V>(vals: &[MaybeUninit<V>], to_index: &Function, key: &K) -> V
-where
-    K: ?Sized + Hash,
-{
-    unsafe { get_unchecked_uninit(vals, to_index, key).assume_init_read() }
+    let idx = unsafe { to_index.get(key).unwrap_unchecked() };
+    unsafe { vals.get_unchecked_mut(idx).take().unwrap_unchecked() }
 }
 
 /// `strs` must be sorted.
@@ -423,7 +400,7 @@ mod bench {
     };
 
     fn make_kvs() -> impl Iterator<Item = (String, String)> {
-        const SIZE: usize = 4096;
+        const SIZE: usize = 8192;
 
         (0..SIZE).map(|i| {
             let mut hasher = std::hash::DefaultHasher::default();
