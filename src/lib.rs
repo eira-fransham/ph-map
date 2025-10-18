@@ -204,7 +204,7 @@ where
 
         // We need to set a minimum value above 4, as for some reason Rust doesn't reserve
         // correctly for small vectors.
-        let mut max_idx = 8;
+        let mut max_idx = keys.len();
 
         self.top_level_hashes = vec![0; keys.len()];
 
@@ -279,7 +279,7 @@ where
         // TODO: This assumes that the `Hash` implementation for `KRef` is well-behaved,
         //       but does not cause unsafety if this is not the case.
         let hash = self.to_index.hasher().hash_one(key.as_ref(), 0);
-        let idx = self.to_index.get_with_top_level_hash(&key.as_ref(), hash)?;
+        let idx = self.to_index.get_with_top_level_hash(key.as_ref(), hash)?;
         if *self.top_level_hashes.get(idx)? == hash {
             Some(unsafe { self.values.get_unchecked_mut(idx).assume_init_mut() })
         } else {
@@ -423,7 +423,7 @@ mod bench {
     };
 
     fn make_kvs() -> impl Iterator<Item = (String, String)> {
-        const SIZE: usize = 128;
+        const SIZE: usize = 4096;
 
         (0..SIZE).map(|i| {
             let mut hasher = std::hash::DefaultHasher::default();
