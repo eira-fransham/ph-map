@@ -1,6 +1,6 @@
 # `ph-map`
 
-Tests to use perfect hashing to make faster maps/sets given unlimited construction time.
+Tests to use perfect hashing to make faster maps/sets at the cost of construction time.
 
 ```
 running 7 tests
