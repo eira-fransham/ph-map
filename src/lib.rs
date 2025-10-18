@@ -270,7 +270,7 @@ mod bench {
     use crate::PhMap;
     use std::{
         collections::HashMap,
-        hash::{Hash, Hasher},
+        hash::{BuildHasher, Hash, Hasher},
     };
 
     fn make_kvs() -> impl Iterator<Item = (String, String)> {
@@ -322,6 +322,7 @@ mod bench {
             assert_eq!(std::hint::black_box(hashmap.get(&key[..])), Some(value));
         })
     }
+
     #[bench]
     fn bench_hashbrown_get(b: &mut test::Bencher) {
         let mut hashbrown =
@@ -335,5 +336,94 @@ mod bench {
             let (key, value) = std::hint::black_box(&kvs[idxs.next().unwrap()]);
             assert_eq!(std::hint::black_box(hashbrown.get(&key[..])), Some(value));
         })
+    }
+
+    #[bench]
+    fn bench_hashbrown_no_hash_get(b: &mut test::Bencher) {
+        let mut hashbrown = hashbrown::HashMap::<u64, String, _>::with_hasher(BuildIdentityHasher);
+        let build_hasher = DefaultBuildHasher::default();
+        let kvs = make_kvs()
+            .map(|(k, v)| (build_hasher.hash_one(k), v))
+            .collect::<Vec<_>>();
+        hashbrown.extend(kvs.iter().cloned());
+
+        let mut idxs = (0..kvs.len()).cycle();
+
+        b.iter(|| {
+            let (key, value) = std::hint::black_box(&kvs[idxs.next().unwrap()]);
+            assert_eq!(std::hint::black_box(hashbrown.get(key)), Some(value));
+        })
+    }
+
+    struct BuildIdentityHasher;
+
+    impl BuildHasher for BuildIdentityHasher {
+        type Hasher = IdentityHasher;
+
+        // Required method
+        fn build_hasher(&self) -> Self::Hasher {
+            IdentityHasher(0)
+        }
+    }
+
+    #[repr(transparent)]
+    struct IdentityHasher(u64);
+
+    impl Hasher for IdentityHasher {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.0 = u64::from_ne_bytes(bytes.try_into().unwrap());
+        }
+
+        fn write_u64(&mut self, i: u64) {
+            self.0 = i;
+        }
+
+        fn write_u8(&mut self, i: u8) {
+            self.0 = i as u64;
+        }
+
+        fn write_u16(&mut self, i: u16) {
+            self.0 = i as u64;
+        }
+
+        fn write_u32(&mut self, i: u32) {
+            self.0 = i as u64;
+        }
+
+        fn write_u128(&mut self, i: u128) {
+            self.0 = i as u64;
+        }
+
+        fn write_usize(&mut self, i: usize) {
+            self.0 = i as u64;
+        }
+
+        fn write_i8(&mut self, i: i8) {
+            self.0 = i as u64;
+        }
+
+        fn write_i16(&mut self, i: i16) {
+            self.0 = i as u64;
+        }
+
+        fn write_i32(&mut self, i: i32) {
+            self.0 = i as u64;
+        }
+
+        fn write_i64(&mut self, i: i64) {
+            self.0 = i as u64;
+        }
+
+        fn write_i128(&mut self, i: i128) {
+            self.0 = i as u64;
+        }
+
+        fn write_isize(&mut self, i: isize) {
+            self.0 = i as u64;
+        }
     }
 }
