@@ -19,6 +19,19 @@ test result: ok. 0 passed; 0 failed; 2 ignored; 5 measured; 0 filtered out; fini
 > by default (`rapidhash`), although `PhStrMap` is still faster. All hashmaps use the
 > same hashing algorithm, either `gxhash` or `rapidhash` depending on features.
 
+The benchmarks here show the best-case performance improvements for `ph-map`. Only the
+hash is checked for equality when deciding whether a key is a member of the map, which
+assumes that the key type does not have non-equal members with equal hashes, and only
+access is checked - insertion is orders of magnitude slower.
+
+While `ph-map` only gives a meagre performance benefit even in this optimal case, it's
+possible to imagine that it could still be useful when precalculating a map to be used
+in an environment requiring a strict upper performance bound, such as an audio processing
+callback. The worst-case performance is guaranteed to be better than
+`hashbrown`/`std::collections::HashMap` - once the hash is calculated (which is
+linear-time in length of key for all hashmaps) the lookup is constant-time, as opposed
+to `hashbrown`/`std`'s implementation which has to do a linear search in the worst case.
+
 ### Benchmark descriptions
 
 - `bench_hashbrown_get`: `hashbrown::HashMap` with `gxhash`
